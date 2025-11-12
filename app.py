@@ -382,4 +382,408 @@ def get_models_dict():
 
     return {
         "Naive Bayes": nb_mod.MultinomialNB(),
-        "Decision Tree": tree_mod.DecisionTreeClassifie_
+        "Decision Tree": tree_mod.DecisionTreeClassifier(random_state=42, class_weight='balanced'),
+        "Logistic Regression": linear_mod.LogisticRegression(max_iter=1000, solver='saga', random_state=42, class_weight='balanced', n_jobs=-1),
+        "SVM": svm_mod.SVC(kernel='linear', C=0.5, random_state=42, class_weight='balanced', probability=False)
+    }
+
+def create_binary_target(df: pd.DataFrame) -> pd.DataFrame:
+    REAL_LABELS = ["True", "No Flip", "Mostly True", "Half Flip", "Half True"]
+    FAKE_LABELS = ["False", "Barely True", "Pants On Fire", "Full Flop"]
+
+    def map_label(l):
+        if pd.isna(l):
+            return np.nan
+        l = str(l).strip()
+        if l in REAL_LABELS:
+            return 1
+        if l in FAKE_LABELS:
+            return 0
+        low = l.lower()
+        if "true" in low and "mostly" not in low and "half" not in low:
+            return 1
+        if "false" in low or "pants" in low or "fire" in low:
+            return 0
+        return np.nan
+
+    df = df.copy()
+    df["target_label"] = df["label"].apply(map_label)
+    return df
+
+# ---------------------------
+# Precompute & cache features once per phase (lazy model & libs used inside)
+# ---------------------------
+@st.cache_data(ttl=60*60)
+def compute_features_for_phase(df_statements: pd.Series, selected_phase: str):
+    """
+    Compute features for the whole dataset and cache them. This function will import spaCy if needed.
+    """
+    nlp = get_nlp_model()
+    t0 = time.time()
+    X_feat, vect = apply_feature_extraction(df_statements, selected_phase, nlp)
+    logger.info("Computed features for phase '%s' in %.3fs", selected_phase, time.time() - t0)
+    return X_feat, vect
+
+def evaluate_models(df: pd.DataFrame, selected_phase: str, nlp) -> pd.DataFrame:
+    """
+    Evaluate multiple models. Heavy libs (imblearn/SMOTE) are imported lazily here.
+    """
+    # lazy imports for modeling augmentations
+    try:
+        imblearn_mod = importlib.import_module("imblearn.over_sampling")
+        ImbPipeline_mod = importlib.import_module("imblearn.pipeline")
+    except Exception:
+        imblearn_mod = None
+        ImbPipeline_mod = None
+
+    from sklearn.model_selection import StratifiedKFold
+    from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
+
+    df = create_binary_target(df)
+    df = df.dropna(subset=["target_label"])
+    df = df[df["statement"].astype(str).str.len() > 10]
+
+    X_raw = df["statement"].astype(str)
+    y_raw = df["target_label"].astype(int)
+
+    if len(np.unique(y_raw)) < 2:
+        st.error("Only one class present after mapping — adjust data or date range.")
+        return pd.DataFrame()
+
+    # Precompute features once for the whole dataset
+    try:
+        X_full, vectorizer = compute_features_for_phase(X_raw, selected_phase)
+    except Exception as rexc:
+        st.error(str(rexc))
+        return pd.DataFrame()
+    except Exception as e:
+        st.error(f"Feature precomputation failed: {e}")
+        return pd.DataFrame()
+
+    models = get_models_dict()
+    results = []
+
+    skf = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=42)
+    n_samples = len(y_raw)
+
+    # Utility to index into X_full whether it's sparse or numpy
+    def slice_X(X, idx):
+        if sp_sparse.issparse(X):
+            return X[idx]
+        else:
+            return X[idx]
+
+    for name, model in models.items():
+        st.caption(f"Training {name}...")
+        fold_acc, fold_f1, fold_prec, fold_rec = [], [], [], []
+        train_times, infer_times = [], []
+
+        for fold, (train_idx, test_idx) in enumerate(skf.split(np.zeros(n_samples), y_raw)):
+            try:
+                if vectorizer is not None:
+                    X_train = slice_X(X_full, train_idx)
+                    X_test = slice_X(X_full, test_idx)
+                else:
+                    X_train = slice_X(X_full, train_idx)
+                    X_test = slice_X(X_full, test_idx)
+
+                y_train = y_raw.values[train_idx]
+                y_test = y_raw.values[test_idx]
+
+                start_train = time.time()
+
+                # Special-case Naive Bayes: convert to dense
+                if name == "Naive Bayes":
+                    if sp_sparse.issparse(X_train):
+                        Xt_fit = X_train.toarray().astype(float)
+                    else:
+                        Xt_fit = np.abs(X_train).astype(float)
+                    model.fit(Xt_fit, y_train)
+                    clf = model
+                else:
+                    # Use SMOTE if available (imported lazily), otherwise train without SMOTE
+                    if imblearn_mod and ImbPipeline_mod:
+                        SMOTE = getattr(imblearn_mod, "SMOTE")
+                        ImbPipeline = getattr(ImbPipeline_mod, "Pipeline")
+                        sm = SMOTE(random_state=42, k_neighbors=3, n_jobs=-1)
+                        pipeline = ImbPipeline([("smote", sm), ("clf", model)])
+                        pipeline.fit(X_train, y_train)
+                        clf = pipeline
+                    else:
+                        # fallback: fit model directly
+                        model.fit(X_train if not sp_sparse.issparse(X_train) else X_train, y_train)
+                        clf = model
+
+                train_time = time.time() - start_train
+                start_inf = time.time()
+
+                y_pred = clf.predict(X_test)
+
+                infer_time = (time.time() - start_inf) * 1000.0
+
+                fold_acc.append(accuracy_score(y_test, y_pred))
+                fold_f1.append(f1_score(y_test, y_pred, average="weighted", zero_division=0))
+                fold_prec.append(precision_score(y_test, y_pred, average="weighted", zero_division=0))
+                fold_rec.append(recall_score(y_test, y_pred, average="weighted", zero_division=0))
+                train_times.append(train_time)
+                infer_times.append(infer_time)
+            except Exception as e:
+                st.warning(f"Fold {fold+1} failed for {name}: {e}")
+                fold_acc.append(0); fold_f1.append(0); fold_prec.append(0); fold_rec.append(0)
+                train_times.append(0); infer_times.append(9999)
+
+        results.append({
+            "Model": name,
+            "Accuracy": np.mean(fold_acc) * 100,
+            "F1-Score": np.mean(fold_f1),
+            "Precision": np.mean(fold_prec),
+            "Recall": np.mean(fold_rec),
+            "Training Time (s)": round(np.mean(train_times), 3),
+            "Inference Latency (ms)": round(np.mean(infer_times), 3)
+        })
+
+    return pd.DataFrame(results)
+
+# ---------------------------
+# Humorous critiques (unchanged)
+# ---------------------------
+def get_phase_critique(best_phase: str) -> str:
+    critiques = {
+        "Lexical & Morphological": ["Ah, the Lexical phase. Proving that sometimes, all you need is raw vocabulary and minimal effort. It's the high-school dropout that won the Nobel Prize.", "Just words, nothing fancy. This phase decided to ditch the deep thought and focus on counting. Turns out, quantity has a quality all its own.", "The Lexical approach: when in doubt, just scream the words louder. It lacks elegance but gets the job done."],
+        "Syntactic": ["Syntactic features won? So grammar actually matters! We must immediately inform Congress. This phase is the meticulous editor who corrects everyone's texts.", "The grammar police have prevailed. This model focused purely on structure, proving that sentence construction is more important than meaning... wait, is that how politics works?", "It passed the grammar check! This phase is the sensible adult in the room, refusing to process any nonsense until the parts of speech align."],
+        "Semantic": ["The Semantic phase won by feeling its feelings. It's highly emotional, heavily relying on vibes and tone. Surprisingly effective, just like a good political ad.", "It turns out sentiment polarity is the secret sauce! This model just needed to know if the statement felt 'good' or 'bad.' Zero complex reasoning required.", "Semantic victory! The model simply asked, 'Are they being optimistic or negative?' and apparently that was enough to crush the competition."],
+        "Discourse": ["Discourse features won! This phase is the over-analyzer, counting sentences and focusing on the rhythm of the argument. It knows the debate structure better than the content.", "The long-winded champion! This model cared about how the argument was *structured*—the thesis, the body, the conclusion. It's basically the high school debate team captain.", "Discourse is the winner! It successfully mapped the argument's flow, proving that presentation beats facts."],
+        "Pragmatic": ["The Pragmatic phase won by focusing on keywords like 'must' and '?'. It just needed to know the speaker's intent. It's the Sherlock Holmes of NLP.", "It's all about intent! This model ignored the noise and hunted for specific linguistic tells. It’s concise, ruthless, and apparently correct.", "Pragmatic features for the win! The model knows that if someone uses three exclamation marks, they're either lying or selling crypto. Either way, it's a clue."],
+    }
+    return random.choice(critiques.get(best_phase, ["The results are in, and the system is speechless. It seems we need to hire a better comedian."]))
+
+def get_model_critique(best_model: str) -> str:
+    critiques = {
+        "Naive Bayes": ["Naive Bayes: It's fast, it's simple, and it assumes every feature is independent. The model is either brilliant or blissfully unaware, but hey, it works!", "The Simpleton Savant has won! Naive Bayes brings zero drama and just counts things. It’s the least complicated tool in the box, which is often the best.", "NB pulled off a victory. It’s the 'less-is-more' philosopher who manages to outperform all the complex math majors."],
+        "Decision Tree": ["The Decision Tree won by asking a series of simple yes/no questions until it got tired. It's transparent, slightly judgmental, and surprisingly effective.", "The Hierarchical Champion! It built a beautiful, intricate set of if/then statements. It's the most organized person in the office, and the accuracy shows it.", "Decision Tree victory! It achieved success by splitting the data until it couldn't be split anymore. A classic strategy in science and divorce."],
+        "Logistic Regression": ["Logistic Regression: The veteran politician of ML. It draws a clean, straight line to victory. Boring, reliable, and hard to beat.", "The Straight-Line Stunner. It uses simple math to predict complex reality. It's predictable, efficient, and definitely got tenure.", "LogReg prevails! The model's philosophy is: 'Probability is all you need.' It's the safest bet, and the accuracy score agrees."],
+        "SVM": ["SVM: It found the biggest, widest gap between the truth and the lies, and parked its hyperplane right there. Aggressive but effective boundary enforcement.", "The Maximizing Margin Master! SVM doesn't just separate classes; it builds a fortress between them. It's the most dramatic and highly paid algorithm here.", "SVM crushed it! It’s the model that believes in extreme boundaries. No fuzzy logic, just a hard, clean, dividing line."],
+    }
+    return random.choice(critiques.get(best_model, ["This model broke the simulation, so we have nothing funny to say."]))
+
+def generate_humorous_critique(df_results: pd.DataFrame, selected_phase: str) -> str:
+    if df_results.empty:
+        return "The system failed to train anything. We apologize; our ML models are currently on strike demanding better data and less existential dread."
+    df_results = df_results.copy()
+    df_results['F1-Score'] = pd.to_numeric(df_results['F1-Score'], errors='coerce').fillna(0)
+    best_idx = df_results['F1-Score'].idxmax()
+    best_model_row = df_results.loc[best_idx]
+    best_model = best_model_row['Model']
+    max_f1 = best_model_row['F1-Score']
+    max_acc = best_model_row['Accuracy']
+    phase_critique = get_phase_critique(selected_phase)
+    model_critique = get_model_critique(best_model)
+    headline = f"👑 The Golden Snitch Award goes to the {best_model}!"
+    summary = (
+        f"**Accuracy Report Card:** {headline}\n\n"
+        f"This absolute unit achieved a **{max_acc:.2f}% Accuracy** (and {max_f1:.2f} F1-Score) on the `{selected_phase}` feature set. "
+        f"It beat its rivals, proving that when faced with political statements, the winning strategy was to rely on: **{selected_phase} features!**\n\n"
+    )
+    roast = (
+        f"### The AI Roast (Certified by a Data Scientist):\n"
+        f"**Phase Performance:** {phase_critique}\n\n"
+        f"**Model Personality:** {model_critique}\n\n"
+        f"*(Disclaimer: All models were equally confused by the 'Mostly True' label, which they collectively deemed an existential threat.)*"
+    )
+    return summary + roast
+
+# ---------------------------
+# STREAMLIT APP UI (tabs + dark theme)
+# ---------------------------
+def app():
+    st.set_page_config(page_title='AI vs. Fact: NLP Comparator', layout='wide')
+
+    # quick startup info to help debugging long cold starts
+    st.sidebar.markdown("### Startup diagnostics")
+    nlp_available = True
+    try:
+        # check if spaCy model loads quickly (without doing heavy work)
+        _ = get_nlp_model()
+        if _ is None:
+            nlp_available = False
+    except Exception:
+        nlp_available = False
+    st.sidebar.write(f"spaCy model available: {nlp_available}")
+    # note: we intentionally do not import sklearn/textblob/imblearn at startup
+
+    # Initialize session state defaults
+    if 'scraped_df' not in st.session_state:
+        st.session_state['scraped_df'] = pd.DataFrame()
+    if 'df_results' not in st.session_state:
+        st.session_state['df_results'] = pd.DataFrame()
+    if 'selected_phase_run' not in st.session_state:
+        st.session_state['selected_phase_run'] = ""
+
+    # CSS for dark news portal look
+    st.markdown(
+        """
+        <style>
+        .stApp { background: linear-gradient(180deg,#05070a,#0b0f12); color: #e9f4ff; }
+        .topbar { background: linear-gradient(90deg,#071029,#3b0f34); padding:18px;border-radius:10px;margin-bottom:14px;box-shadow:0 10px 30px rgba(0,0,0,0.6);}
+        .topbar h1 { margin:0; font-size:2.2rem; color: #fff; }
+        .topbar p { margin:2px 0 0 0; color:#bcd7ef; opacity:0.9; }
+        .panel { background: rgba(255,255,255,0.02); padding:12px; border-radius:10px; border:1px solid rgba(255,255,255,0.03); }
+        .card { background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01)); padding:12px;border-radius:10px;margin-bottom:12px;border:1px solid rgba(255,255,255,0.03); }
+        .small { color:#9fb1c6; font-size:0.85rem; }
+        .muted { color:#99aebf; }
+        .link-button { display:inline-block; padding:8px 12px; border-radius:8px; background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.04); color: #dceefc; text-decoration: none; margin-top:6px; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown('<div class="topbar"><h1>AI vs. Fact — Global FactCheck Network</h1><p>Portal: Scrape, Train, Evaluate, and Cross-check claims with verified sources.</p></div>', unsafe_allow_html=True)
+
+    tabs = st.tabs(["Home", "Scraper", "Model Showdown", "Fact Check"])
+
+    # Home
+    with tabs[0]:
+        st.markdown('<div class="panel">', unsafe_allow_html=True)
+        st.subheader("Welcome")
+        st.write("This portal helps you build models to identify factual claims and cross-check statements against verified fact-check sources.")
+        st.write("Use the tabs to the right to scrape Politifact, run model benchmarks, or quickly check individual claims using Google Fact Check Tools.")
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    # Scraper
+    with tabs[1]:
+        st.markdown('<div class="panel">', unsafe_allow_html=True)
+        st.header("Politifact Scraper")
+        min_date = pd.to_datetime('2007-01-01')
+        max_date = pd.to_datetime('today').normalize()
+        start_date = st.date_input("Start Date", min_value=min_date, max_value=max_date, value=pd.to_datetime('2023-01-01'))
+        end_date = st.date_input("End Date", min_value=min_date, max_value=max_date, value=max_date)
+        if st.button("Scrape Politifact Data ⛏️", key="scrape_btn"):
+            if start_date > end_date:
+                st.error("Error: Start Date must be before or equal to End Date.")
+            else:
+                with st.spinner("Scraping..."):
+                    scraped_df = scrape_data_by_date_range(pd.to_datetime(start_date), pd.to_datetime(end_date))
+                    if scraped_df.empty:
+                        st.warning("No data scraped — try narrowing the date range or check the target site structure.")
+                    else:
+                        st.session_state['scraped_df'] = scraped_df
+                        st.success(f"Scraping complete! {len(scraped_df)} claims harvested.")
+                        st.download_button(
+                            "Download scraped CSV",
+                            scraped_df.to_csv(index=False).encode('utf-8'),
+                            file_name="politifact_scraped.csv",
+                            mime="text/csv"
+                        )
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    # Model Showdown
+    with tabs[2]:
+        st.markdown('<div class="panel">', unsafe_allow_html=True)
+        st.header("Model Showdown — Train & Evaluate")
+        if st.session_state['scraped_df'].empty:
+            st.info("No scraped dataset loaded. Scrape data first in the 'Scraper' tab.")
+        else:
+            df = st.session_state['scraped_df']
+            st.write(f"Loaded dataset with {len(df)} rows.")
+            phases = ["Lexical & Morphological", "Syntactic", "Semantic", "Discourse", "Pragmatic"]
+            selected_phase = st.selectbox("Choose the Feature Set (NLP Phase):", phases, key="phase_select")
+            if st.button("Analyze Model Showdown 🥊", key="analyze_btn"):
+                # lazy-load model
+                nlp = get_nlp_model()
+                if nlp is None:
+                    st.warning("spaCy model not available. The app will use faster fallbacks (regex tokenization). Install 'en_core_web_sm' to use full features.")
+                with st.spinner(f"Precomputing features for {selected_phase}..."):
+                    try:
+                        _ = compute_features_for_phase(df["statement"].astype(str), selected_phase)
+                    except Exception as e:
+                        st.error(f"Feature computation failed: {e}")
+                        _ = None
+
+                with st.spinner(f"Training models using {selected_phase} features..."):
+                    df_results = evaluate_models(df, selected_phase, nlp)
+                    st.session_state['df_results'] = df_results
+                    st.session_state['selected_phase_run'] = selected_phase
+                    if not df_results.empty:
+                        st.success("Analysis complete! Results ready.")
+                    else:
+                        st.warning("Analysis returned no results. Check logs or data.")
+
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    # Fact Check tab (search UI moved here)
+    with tabs[3]:
+        st.markdown('<div class="panel">', unsafe_allow_html=True)
+        st.header("Cross-Platform Fact Check")
+        if not API_KEY:
+            st.warning("No Google Fact Check API key configured. Add GOOGLE_FACTCHECK_API_KEY to Streamlit secrets to enable cross-checking.")
+        user_query = st.text_input("Enter a claim or statement to fact-check:", key="sidebar_query")
+        if st.button("Check Fact Credibility", key="factcheck_btn"):
+            if not user_query.strip():
+                st.warning("Please enter a statement to check.")
+            else:
+                with st.spinner("Fetching verified fact-checks..."):
+                    results = get_fact_check_results(user_query)
+                if not results:
+                    st.info("No verified fact-checks found for this claim.")
+                else:
+                    if len(results) == 1 and results[0].get("publisher") == "Error":
+                        st.error(results[0].get("title", "Unknown API error"))
+                    else:
+                        st.success(f"Found {len(results)} fact-check result(s):")
+                        for r in results[:10]:
+                            st.markdown('<div class="card">', unsafe_allow_html=True)
+                            pub_text = r.get('publisher', 'Unknown')
+                            rating_text = r.get('rating', 'No Rating')
+                            title_text = r.get('title', '')
+                            url = r.get("url", "#")
+                            st.markdown(f"**Source:** <span class='small'>{st.text(pub_text)}</span>", unsafe_allow_html=True)
+                            st.markdown(f"**Verdict:** <span class='muted'>{st.text(rating_text)}</span>", unsafe_allow_html=True)
+                            if title_text:
+                                st.markdown(f"**{st.text(title_text)}**")
+                            st.markdown(f'<a href="{url}" target="_blank" class="link-button">Read article</a>', unsafe_allow_html=True)
+                            st.markdown('</div>', unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    # Sidebar quick-check convenience (duplicate of tab but helpful)
+    st.sidebar.subheader("🔍 Quick Fact Check")
+    sidebar_query = st.sidebar.text_input("Claim or headline", key="sidebar_quick_query")
+    if st.sidebar.button("Check (Sidebar)"):
+        q = (sidebar_query or "").strip()
+        if not q:
+            st.sidebar.warning("Please enter a claim or headline.")
+        else:
+            results = get_fact_check_results(q)
+            if len(results) == 1 and results[0].get("publisher") == "Error":
+                st.sidebar.error(results[0].get("title", "API error"))
+            elif not results:
+                st.sidebar.info("No fact-checks found.")
+            else:
+                for r in results[:5]:
+                    st.sidebar.markdown(f"**{r.get('publisher','Unknown')}** — {r.get('rating','No Rating')}")
+                    st.sidebar.markdown(f"[Read]({r.get('url','#')})")
+
+    # Metrics & critique area available via session_state
+    if 'df_results' in st.session_state and not st.session_state['df_results'].empty:
+        st.markdown('<div class="panel">', unsafe_allow_html=True)
+        st.subheader("Latest Run — Summary")
+        df_results = st.session_state['df_results']
+        st.dataframe(df_results[['Model','Accuracy','F1-Score','Training Time (s)','Inference Latency (ms)']], height=220, use_container_width=True)
+        # Download results
+        st.download_button(
+            "Download Results CSV",
+            df_results.to_csv(index=False).encode('utf-8'),
+            file_name="model_results.csv",
+            mime="text/csv"
+        )
+        # simple plot
+        plot_metric = st.selectbox("Metric to Plot:", ['Accuracy','F1-Score','Precision','Recall','Training Time (s)','Inference Latency (ms)'], index=1)
+        df_plot = df_results[['Model', plot_metric]].set_index('Model')
+        st.bar_chart(df_plot)
+        # humorous critique
+        if st.button("Generate Humorous Critique"):
+            critique_text = generate_humorous_critique(df_results, st.session_state.get('selected_phase_run', 'Unknown'))
+            st.markdown(critique_text)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+if __name__ == "__main__":
+    app()

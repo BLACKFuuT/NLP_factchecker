@@ -1,7 +1,24 @@
+# Core web framework
 streamlit==1.39.0
+
+# Data handling
 pandas==2.2.3
 numpy==1.26.4
+
+# Web scraping
 beautifulsoup4==4.12.3
 requests==2.32.3
 ftfy==6.2.3
+
+# ML / NLP (needed for Model Showdown)
+scikit-learn==1.5.2
+imbalanced-learn==0.12.3
+textblob==0.18.0.post0
+
+# OPTIONAL: spaCy (keep if you want spaCy)
+spacy==3.8.2
+# spaCy model wheel (optional; large — include if you want the model preinstalled)
+# https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl
+
+# Optional utilities
 tqdm==4.66.5

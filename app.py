@@ -36,7 +36,7 @@ from scipy import sparse as sp_sparse
 # ---------------------------
 # Config & constants (tuned for speed)
 # ---------------------------
-SCRAPED_DATA_PATH = "politifact_data.csv"
+SCRAPED_DATA_PATH = "politifact_scraped.csv"
 N_SPLITS = 3                    # fewer CV folds -> faster runs
 MAX_PAGES = 20                  # limit scraping by default
 REQUEST_RETRIES = 1             # avoid long retry stalls

@@ -1,4 +1,4 @@
-# app.py (redesigned UI: news portal dark theme + tabs)
+# app.py (redesigned UI: news portal dark theme + tabs) — optimized version
 import os
 import io
 import csv
@@ -31,14 +31,17 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.svm import SVC
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 
+from scipy import sparse as sp_sparse
+
 # ---------------------------
-# Config & constants
+# Config & constants (tuned for speed)
 # ---------------------------
 SCRAPED_DATA_PATH = "politifact_data.csv"
-N_SPLITS = 5
-MAX_PAGES = 100
-REQUEST_RETRIES = 3
-REQUEST_BACKOFF = 2
+N_SPLITS = 3                    # fewer CV folds -> faster runs
+MAX_PAGES = 20                  # limit scraping by default
+REQUEST_RETRIES = 1             # avoid long retry stalls
+REQUEST_BACKOFF = 1             # shorter backoff
+DEFAULT_TIMEOUT = 8             # shorter HTTP timeout (seconds)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -58,7 +61,7 @@ def clean(s: Optional[str]) -> Optional[str]:
         pass
     return " ".join(s.split()).strip()
 
-def safe_get(url: str, timeout: int = 15) -> Optional[requests.Response]:
+def safe_get(url: str, timeout: int = DEFAULT_TIMEOUT) -> Optional[requests.Response]:
     backoff = REQUEST_BACKOFF
     for attempt in range(REQUEST_RETRIES):
         try:
@@ -67,8 +70,9 @@ def safe_get(url: str, timeout: int = 15) -> Optional[requests.Response]:
             return r
         except Exception as e:
             logger.warning(f"Request error ({attempt+1}/{REQUEST_RETRIES}) for {url}: {e}")
-            time.sleep(backoff)
-            backoff *= 2
+            if attempt < REQUEST_RETRIES - 1:
+                time.sleep(backoff)
+                backoff *= 2
     return None
 
 # ---------------------------
@@ -144,7 +148,7 @@ def scrape_data_by_date_range(start_date: pd.Timestamp, end_date: pd.Timestamp) 
             break
         seen_urls.add(current_url)
 
-        resp = safe_get(current_url, timeout=15)
+        resp = safe_get(current_url, timeout=DEFAULT_TIMEOUT)
         if resp is None:
             st.warning(f"Failed to fetch {current_url} after retries; stopping scraper.")
             break
@@ -236,7 +240,7 @@ def scrape_data_by_date_range(start_date: pd.Timestamp, end_date: pd.Timestamp) 
     return df
 
 # ---------------------------
-# Feature extraction & modeling helpers
+# Feature extraction & modeling helpers (with smaller vectorizers)
 # ---------------------------
 stop_words = STOP_WORDS
 pragmatic_words = ["must", "should", "might", "could", "will", "?", "!"]
@@ -278,16 +282,18 @@ def pragmatic_features_batch(texts: List[str]) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=pragmatic_words)
 
 def apply_feature_extraction(X_series: pd.Series, phase: str, nlp) -> Tuple[np.ndarray, Optional[object]]:
+    """Return (feature_matrix, vectorizer_or_None). Feature matrix may be sparse."""
     X_texts = X_series.astype(str).tolist()
+    # Note: vectorizer params reduced (max_features/min_df) for speed
     if phase == "Lexical & Morphological":
         X_proc = lexical_features_batch(X_texts, nlp)
-        vect = CountVectorizer(binary=True, ngram_range=(1,2), min_df=2)
+        vect = CountVectorizer(binary=True, ngram_range=(1,2), min_df=3, max_features=2000)
         X_feat = vect.fit_transform(X_proc)
         return X_feat, vect
 
     if phase == "Syntactic":
         X_proc = syntactic_features_batch(X_texts, nlp)
-        vect = TfidfVectorizer(max_features=5000)
+        vect = TfidfVectorizer(max_features=2000, min_df=3)
         X_feat = vect.fit_transform(X_proc)
         return X_feat, vect
 
@@ -297,7 +303,7 @@ def apply_feature_extraction(X_series: pd.Series, phase: str, nlp) -> Tuple[np.n
 
     if phase == "Discourse":
         X_proc = discourse_features_batch(X_texts, nlp)
-        vect = CountVectorizer(ngram_range=(1,2), max_features=5000)
+        vect = CountVectorizer(ngram_range=(1,2), max_features=2000, min_df=2)
         X_feat = vect.fit_transform(X_proc)
         return X_feat, vect
 
@@ -311,7 +317,7 @@ def get_models_dict():
     return {
         "Naive Bayes": MultinomialNB(),
         "Decision Tree": DecisionTreeClassifier(random_state=42, class_weight='balanced'),
-        "Logistic Regression": LogisticRegression(max_iter=1000, solver='liblinear', random_state=42, class_weight='balanced'),
+        "Logistic Regression": LogisticRegression(max_iter=1000, solver='saga', random_state=42, class_weight='balanced', n_jobs=-1),
         "SVM": SVC(kernel='linear', C=0.5, random_state=42, class_weight='balanced', probability=False)
     }
 
@@ -338,7 +344,22 @@ def create_binary_target(df: pd.DataFrame) -> pd.DataFrame:
     df["target_label"] = df["label"].apply(map_label)
     return df
 
+# ---------------------------
+# New: precompute & cache features once per phase
+# ---------------------------
+@st.cache_data(ttl=60*60)
+def compute_features_for_phase(df_statements: pd.Series, selected_phase: str):
+    """Compute features for the entire dataset once and cache them."""
+    nlp = get_nlp_model()
+    if nlp is None:
+        raise RuntimeError("spaCy model not available")
+    t0 = time.time()
+    X_feat, vect = apply_feature_extraction(df_statements, selected_phase, nlp)
+    logger.info("Computed features for phase '%s' in %.3fs", selected_phase, time.time() - t0)
+    return X_feat, vect
+
 def evaluate_models(df: pd.DataFrame, selected_phase: str, nlp) -> pd.DataFrame:
+    """Evaluate multiple models using precomputed features + StratifiedKFold slicing."""
     df = create_binary_target(df)
     df = df.dropna(subset=["target_label"])
     df = df[df["statement"].astype(str).str.len() > 10]
@@ -350,66 +371,74 @@ def evaluate_models(df: pd.DataFrame, selected_phase: str, nlp) -> pd.DataFrame:
         st.error("Only one class present after mapping — adjust data or date range.")
         return pd.DataFrame()
 
-    X_features_full, vectorizer = apply_feature_extraction(X_raw, selected_phase, nlp)
+    # Precompute features once for the whole dataset
+    try:
+        X_full, vectorizer = compute_features_for_phase(X_raw, selected_phase)
+    except RuntimeError as rexc:
+        st.error(str(rexc))
+        return pd.DataFrame()
+    except Exception as e:
+        st.error(f"Feature precomputation failed: {e}")
+        return pd.DataFrame()
 
     models = get_models_dict()
     results = []
 
     skf = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=42)
-    X_list = X_raw.tolist()
+    n_samples = len(y_raw)
+
+    # Utility to index into X_full whether it's sparse or numpy
+    def slice_X(X, idx):
+        if sp_sparse.issparse(X):
+            return X[idx]
+        else:
+            return X[idx]
 
     for name, model in models.items():
         st.caption(f"Training {name}...")
         fold_acc, fold_f1, fold_prec, fold_rec = [], [], [], []
         train_times, infer_times = [], []
 
-        for fold, (train_idx, test_idx) in enumerate(skf.split(np.zeros(len(y_raw)), y_raw)):
-            X_train_raw = pd.Series([X_list[i] for i in train_idx])
-            X_test_raw = pd.Series([X_list[i] for i in test_idx])
-            y_train = y_raw.values[train_idx]
-            y_test = y_raw.values[test_idx]
-
-            if vectorizer is not None:
-                if selected_phase == "Lexical & Morphological":
-                    X_train_proc = lexical_features_batch(X_train_raw.tolist(), nlp)
-                    X_test_proc  = lexical_features_batch(X_test_raw.tolist(), nlp)
-                elif selected_phase == "Syntactic":
-                    X_train_proc = syntactic_features_batch(X_train_raw.tolist(), nlp)
-                    X_test_proc  = syntactic_features_batch(X_test_raw.tolist(), nlp)
-                elif selected_phase == "Discourse":
-                    X_train_proc = discourse_features_batch(X_train_raw.tolist(), nlp)
-                    X_test_proc  = discourse_features_batch(X_test_raw.tolist(), nlp)
-                else:
-                    X_train_proc = X_train_raw.tolist()
-                    X_test_proc  = X_test_raw.tolist()
-
-                X_train = vectorizer.transform(X_train_proc)
-                X_test  = vectorizer.transform(X_test_proc)
-            else:
-                if selected_phase == "Semantic":
-                    X_train = semantic_features_batch(X_train_raw.tolist()).values
-                    X_test  = semantic_features_batch(X_test_raw.tolist()).values
-                elif selected_phase == "Pragmatic":
-                    X_train = pragmatic_features_batch(X_train_raw.tolist()).values
-                    X_test  = pragmatic_features_batch(X_test_raw.tolist()).values
-                else:
-                    X_train = X_train_raw.values.reshape(-1, 1)
-                    X_test  = X_test_raw.values.reshape(-1, 1)
-
-            start_train = time.time()
+        for fold, (train_idx, test_idx) in enumerate(skf.split(np.zeros(n_samples), y_raw)):
+            # Slice precomputed features
             try:
+                if vectorizer is not None:
+                    # X_full is already transformed (sparse)
+                    X_train = slice_X(X_full, train_idx)
+                    X_test = slice_X(X_full, test_idx)
+                else:
+                    # numeric features (numpy arrays)
+                    X_train = slice_X(X_full, train_idx)
+                    X_test = slice_X(X_full, test_idx)
+
+                y_train = y_raw.values[train_idx]
+                y_test = y_raw.values[test_idx]
+
+                start_train = time.time()
                 if name == "Naive Bayes":
-                    Xt_fit = np.abs(X_train).astype(float)
+                    # NB expects dense non-negative features — convert if needed
+                    if sp_sparse.issparse(X_train):
+                        Xt_fit = X_train.toarray().astype(float)
+                    else:
+                        Xt_fit = np.abs(X_train).astype(float)
                     model.fit(Xt_fit, y_train)
                     clf = model
                 else:
-                    pipeline = ImbPipeline([("smote", SMOTE(random_state=42, k_neighbors=3)), ("clf", model)])
+                    # Use SMOTE with n_jobs where supported
+                    sm = SMOTE(random_state=42, k_neighbors=3, n_jobs=-1)
+                    pipeline = ImbPipeline([("smote", sm), ("clf", model)])
                     pipeline.fit(X_train, y_train)
                     clf = pipeline
 
                 train_time = time.time() - start_train
                 start_inf = time.time()
-                y_pred = clf.predict(X_test)
+
+                # For dense or sparse, predict should work with pipeline
+                if sp_sparse.issparse(X_test) and hasattr(clf, "predict"):
+                    y_pred = clf.predict(X_test)
+                else:
+                    y_pred = clf.predict(X_test)
+
                 infer_time = (time.time() - start_inf) * 1000.0
 
                 fold_acc.append(accuracy_score(y_test, y_pred))
@@ -435,6 +464,9 @@ def evaluate_models(df: pd.DataFrame, selected_phase: str, nlp) -> pd.DataFrame:
 
     return pd.DataFrame(results)
 
+# ---------------------------
+# Humorous critiques (unchanged)
+# ---------------------------
 def get_phase_critique(best_phase: str) -> str:
     critiques = {
         "Lexical & Morphological": ["Ah, the Lexical phase. Proving that sometimes, all you need is raw vocabulary and minimal effort. It's the high-school dropout that won the Nobel Prize.", "Just words, nothing fancy. This phase decided to ditch the deep thought and focus on counting. Turns out, quantity has a quality all its own.", "The Lexical approach: when in doubt, just scream the words louder. It lacks elegance but gets the job done."],
@@ -568,6 +600,15 @@ def app():
                 if nlp is None:
                     st.error("spaCy model not available. Install 'en_core_web_sm' to run Model Showdown.")
                 else:
+                    with st.spinner(f"Precomputing features for {selected_phase}..."):
+                        # compute_features_for_phase will be used inside evaluate_models; call directly to show progress and cache
+                        try:
+                            # do one warm compute so the cache entry is created and user sees progress immediately
+                            _ = compute_features_for_phase(df["statement"].astype(str), selected_phase)
+                        except Exception as e:
+                            st.error(f"Feature computation failed: {e}")
+                            _ = None
+
                     with st.spinner(f"Training models using {selected_phase} features..."):
                         df_results = evaluate_models(df, selected_phase, nlp)
                         st.session_state['df_results'] = df_results

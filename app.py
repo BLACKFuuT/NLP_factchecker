@@ -1,12 +1,3 @@
-# TEMP HEALTH CHECK GUARD (remove after debugging)
-import os
-if os.environ.get("STREAMLIT_HEALTH_ONLY", "") == "1":
-    import streamlit as st
-    st.set_page_config(page_title="Health Check")
-    st.title("Health check: container reachable ✅")
-    st.write("STREAMLIT_HEALTH_ONLY=1 — temporary debug page. Remove this after debugging.")
-    st.stop()
-
 # app.py (redesigned UI: news portal dark theme + tabs) — startup-optimized version
 import os
 import io

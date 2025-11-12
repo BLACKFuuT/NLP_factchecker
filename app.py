@@ -11,13 +11,9 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
-from bs4 import BeautifulSoup
 import re
 from urllib.parse import urljoin, quote_plus
-from ftfy import fix_text
 import importlib
-
-from scipy import sparse as sp_sparse
 
 # ---------------------------
 # Config & constants (tuned for speed)
@@ -42,6 +38,8 @@ def clean(s: Optional[str]) -> Optional[str]:
     if s is None:
         return None
     try:
+        # Lazy import ftfy
+        from ftfy import fix_text
         s = fix_text(s)
     except Exception:
         pass
@@ -123,6 +121,9 @@ def get_nlp_model():
 # ---------------------------
 @st.cache_data(ttl=60*60*24)
 def scrape_data_by_date_range(start_date: pd.Timestamp, end_date: pd.Timestamp) -> pd.DataFrame:
+    # Lazy import BeautifulSoup
+    from bs4 import BeautifulSoup
+    
     base_url = "https://www.politifact.com/factchecks/list/"
     current_url = base_url
     seen_urls = set()
@@ -254,13 +255,14 @@ def simple_pos_features(texts: List[str]) -> List[str]:
 # ---------------------------
 # Feature extraction & modeling helpers (lazy imports for faster start)
 # ---------------------------
-stop_words = None
-try:
-    # small import attempt (cheap). If spacy isn't present this is fine.
-    spacy_mod = importlib.import_module("spacy")
-    stop_words = importlib.import_module("spacy.lang.en.stop_words").STOP_WORDS
-except Exception:
-    stop_words = set()
+def get_stop_words():
+    """Lazy load stop words"""
+    try:
+        # small import attempt (cheap). If spacy isn't present this is fine.
+        spacy_mod = importlib.import_module("spacy")
+        return importlib.import_module("spacy.lang.en.stop_words").STOP_WORDS
+    except Exception:
+        return set()
 
 pragmatic_words = ["must", "should", "might", "could", "will", "?", "!"]
 
@@ -269,6 +271,7 @@ def lexical_features_batch(texts: List[str], nlp) -> List[str]:
         return simple_tokenize_to_lemmas(texts)
     processed = []
     for doc in nlp.pipe(texts, disable=["ner", "parser"]):
+        stop_words = get_stop_words()
         toks = [token.lemma_.lower() for token in doc if token.is_alpha and token.lemma_.lower() not in stop_words]
         processed.append(" ".join(toks))
     return processed
@@ -428,6 +431,9 @@ def evaluate_models(df: pd.DataFrame, selected_phase: str, nlp) -> pd.DataFrame:
     """
     Evaluate multiple models. Heavy libs (imblearn/SMOTE) are imported lazily here.
     """
+    # Lazy import scipy.sparse
+    from scipy import sparse as sp_sparse
+    
     # lazy imports for modeling augmentations
     try:
         imblearn_mod = importlib.import_module("imblearn.over_sampling")
@@ -553,16 +559,16 @@ def get_phase_critique(best_phase: str) -> str:
         "Syntactic": ["Syntactic features won? So grammar actually matters! We must immediately inform Congress. This phase is the meticulous editor who corrects everyone's texts.", "The grammar police have prevailed. This model focused purely on structure, proving that sentence construction is more important than meaning... wait, is that how politics works?", "It passed the grammar check! This phase is the sensible adult in the room, refusing to process any nonsense until the parts of speech align."],
         "Semantic": ["The Semantic phase won by feeling its feelings. It's highly emotional, heavily relying on vibes and tone. Surprisingly effective, just like a good political ad.", "It turns out sentiment polarity is the secret sauce! This model just needed to know if the statement felt 'good' or 'bad.' Zero complex reasoning required.", "Semantic victory! The model simply asked, 'Are they being optimistic or negative?' and apparently that was enough to crush the competition."],
         "Discourse": ["Discourse features won! This phase is the over-analyzer, counting sentences and focusing on the rhythm of the argument. It knows the debate structure better than the content.", "The long-winded champion! This model cared about how the argument was *structured*—the thesis, the body, the conclusion. It's basically the high school debate team captain.", "Discourse is the winner! It successfully mapped the argument's flow, proving that presentation beats facts."],
-        "Pragmatic": ["The Pragmatic phase won by focusing on keywords like 'must' and '?'. It just needed to know the speaker's intent. It's the Sherlock Holmes of NLP.", "It's all about intent! This model ignored the noise and hunted for specific linguistic tells. It’s concise, ruthless, and apparently correct.", "Pragmatic features for the win! The model knows that if someone uses three exclamation marks, they're either lying or selling crypto. Either way, it's a clue."],
+        "Pragmatic": ["The Pragmatic phase won by focusing on keywords like 'must' and '?'. It just needed to know the speaker's intent. It's the Sherlock Holmes of NLP.", "It's all about intent! This model ignored the noise and hunted for specific linguistic tells. It's concise, ruthless, and apparently correct.", "Pragmatic features for the win! The model knows that if someone uses three exclamation marks, they're either lying or selling crypto. Either way, it's a clue."],
     }
     return random.choice(critiques.get(best_phase, ["The results are in, and the system is speechless. It seems we need to hire a better comedian."]))
 
 def get_model_critique(best_model: str) -> str:
     critiques = {
-        "Naive Bayes": ["Naive Bayes: It's fast, it's simple, and it assumes every feature is independent. The model is either brilliant or blissfully unaware, but hey, it works!", "The Simpleton Savant has won! Naive Bayes brings zero drama and just counts things. It’s the least complicated tool in the box, which is often the best.", "NB pulled off a victory. It’s the 'less-is-more' philosopher who manages to outperform all the complex math majors."],
+        "Naive Bayes": ["Naive Bayes: It's fast, it's simple, and it assumes every feature is independent. The model is either brilliant or blissfully unaware, but hey, it works!", "The Simpleton Savant has won! Naive Bayes brings zero drama and just counts things. It's the least complicated tool in the box, which is often the best.", "NB pulled off a victory. It's the 'less-is-more' philosopher who manages to outperform all the complex math majors."],
         "Decision Tree": ["The Decision Tree won by asking a series of simple yes/no questions until it got tired. It's transparent, slightly judgmental, and surprisingly effective.", "The Hierarchical Champion! It built a beautiful, intricate set of if/then statements. It's the most organized person in the office, and the accuracy shows it.", "Decision Tree victory! It achieved success by splitting the data until it couldn't be split anymore. A classic strategy in science and divorce."],
         "Logistic Regression": ["Logistic Regression: The veteran politician of ML. It draws a clean, straight line to victory. Boring, reliable, and hard to beat.", "The Straight-Line Stunner. It uses simple math to predict complex reality. It's predictable, efficient, and definitely got tenure.", "LogReg prevails! The model's philosophy is: 'Probability is all you need.' It's the safest bet, and the accuracy score agrees."],
-        "SVM": ["SVM: It found the biggest, widest gap between the truth and the lies, and parked its hyperplane right there. Aggressive but effective boundary enforcement.", "The Maximizing Margin Master! SVM doesn't just separate classes; it builds a fortress between them. It's the most dramatic and highly paid algorithm here.", "SVM crushed it! It’s the model that believes in extreme boundaries. No fuzzy logic, just a hard, clean, dividing line."],
+        "SVM": ["SVM: It found the biggest, widest gap between the truth and the lies, and parked its hyperplane right there. Aggressive but effective boundary enforcement.", "The Maximizing Margin Master! SVM doesn't just separate classes; it builds a fortress between them. It's the most dramatic and highly paid algorithm here.", "SVM crushed it! It's the model that believes in extreme boundaries. No fuzzy logic, just a hard, clean, dividing line."],
     }
     return random.choice(critiques.get(best_model, ["This model broke the simulation, so we have nothing funny to say."]))
 

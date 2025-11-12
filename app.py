@@ -20,7 +20,7 @@ import importlib
 # ---------------------------
 SCRAPED_DATA_PATH = "politifact_scraped.csv"
 N_SPLITS = 3                    # fewer CV folds -> faster runs
-MAX_PAGES = 5                   # <- smaller default to speed scraping by default
+MAX_PAGES = 100                   # <- smaller default to speed scraping by default
 REQUEST_RETRIES = 1             # avoid long retry stalls
 REQUEST_BACKOFF = 1             # shorter backoff
 DEFAULT_TIMEOUT = 8             # shorter HTTP timeout (seconds)
